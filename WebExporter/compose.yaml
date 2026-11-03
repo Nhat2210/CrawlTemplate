@@ -1,0 +1,13 @@
+services:
+  webexporter:
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:4310:4310"
+      - "127.0.0.1:4311:4311"
+    volumes:
+      - webexporter-data:/app/storage
+    shm_size: "1gb"
+    restart: unless-stopped
+volumes:
+  webexporter-data:
