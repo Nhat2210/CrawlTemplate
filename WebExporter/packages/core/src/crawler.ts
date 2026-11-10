@@ -1,5 +1,6 @@
 import { chromium, type BrowserContext } from "playwright";
 import { load } from "cheerio";
+import { init, parse } from "es-module-lexer";
 import postcss from "postcss";
 import valueParser from "postcss-value-parser";
 import path from "node:path";
@@ -16,11 +17,13 @@ import {
 } from "./urls.ts";
 import type { CapturedPage, Issue, Job, Progress, Result } from "./types.ts";
 import { config } from "./config.ts";
+import { imageReplayScript } from "./image-replay.ts";
 
 const mimeExtensions: Record<string, string> = {
   "text/css": ".css",
   "application/javascript": ".js",
   "text/javascript": ".js",
+  "application/json": ".json",
   "image/jpeg": ".jpg",
   "image/png": ".png",
   "image/webp": ".webp",
@@ -33,7 +36,7 @@ const mimeExtensions: Record<string, string> = {
   "image/x-icon": ".ico",
   "video/mp4": ".mp4",
 };
-type Asset = { url: string; path: string; mime: string; body: Buffer };
+type Asset = { base: string; path: string; mime: string; body: Buffer };
 const MAX_ASSET = 20 * 1024 * 1024;
 const MAX_TOTAL = 300 * 1024 * 1024;
 function assetPath(url: string, mime: string) {
@@ -66,13 +69,13 @@ export async function runCapture(
   const assets = new Map<string, Asset>();
   const rawPages: { page: CapturedPage; html: string; base: string }[] = [];
   let totalBytes = 0;
-  const addAsset = (url: string, mime: string, body: Buffer) => {
+  const addAsset = (url: string, mime: string, body: Buffer, base = url) => {
     if (assets.has(url)) return;
     if (body.length > MAX_ASSET || totalBytes + body.length > MAX_TOTAL) {
       issue("asset", url, "Asset skipped: capture size limit reached.");
       return;
     }
-    assets.set(url, { url, mime, body, path: assetPath(url, mime) });
+    assets.set(url, { base, mime, body, path: assetPath(url, mime) });
     totalBytes += body.length;
   };
   const browser = await chromium.launch({ headless: true });
@@ -84,7 +87,7 @@ export async function runCapture(
   try {
     context = await browser.newContext({
       viewport: { width: 1366, height: 900 },
-      reducedMotion: "reduce",
+      reducedMotion: "no-preference",
       serviceWorkers: "block",
       acceptDownloads: false,
     });
@@ -130,7 +133,12 @@ export async function runCapture(
             );
             return;
           }
-          if (request.resourceType() === "document" || !response.ok()) return;
+          if (
+            request.resourceType() === "document" ||
+            response.status() === 206 ||
+            !response.ok()
+          )
+            return;
           pending.push(
             (async () => {
               const mime = (response.headers()["content-type"] || "")
@@ -217,17 +225,33 @@ export async function runCapture(
         if (job.kind === "export") {
           captured.path = pagePath(item.url, entry);
           captured.screenshot = `${pages.length}.png`;
+          const rawPage = {
+            page: captured,
+            html: await tab.evaluate(() => {
+              const root = document.documentElement;
+              const clone = root.cloneNode(true) as HTMLElement;
+              const styles = clone.querySelectorAll("style");
+              root.querySelectorAll("style").forEach((style, index) => {
+                // CSS-in-JS can insert rules into a style with no text node.
+                if (!style.textContent?.trim() && style.sheet?.cssRules.length)
+                  styles[index].textContent = Array.from(
+                    style.sheet.cssRules,
+                    (rule) => rule.cssText,
+                  ).join("\n");
+              });
+              const doctype = document.doctype
+                ? new XMLSerializer().serializeToString(document.doctype)
+                : "";
+              return doctype + clone.outerHTML;
+            }),
+            base: await tab.evaluate(() => document.baseURI),
+          };
           await tab.screenshot({
             path: path.join(dir, "screenshots", captured.screenshot),
             fullPage: false,
-            animations: "disabled",
             timeout: config.timeout,
           });
-          rawPages.push({
-            page: captured,
-            html: await tab.content(),
-            base: await tab.evaluate(() => document.baseURI),
-          });
+          rawPages.push(rawPage);
         }
         pages.push(captured);
       } catch (error) {
@@ -299,7 +323,7 @@ export async function runCapture(
           }
           chunks.push(value);
         }
-        addAsset(url, mime, Buffer.concat(chunks));
+        addAsset(url, mime, Buffer.concat(chunks), target);
         return assets.get(url);
       }
       throw new Error("Too many redirects.");
@@ -412,7 +436,35 @@ export async function runCapture(
       return css;
     }
   };
+  await init;
+  const rewriteScript = async (source: string, base: string, from: string) => {
+    let imports;
+    try {
+      [imports] = parse(source);
+    } catch {
+      issue("asset", base, "JavaScript could not be parsed for module links.");
+      return source;
+    }
+    // Apply edits right to left so each replacement uses the original offsets.
+    for (const entry of [...imports].reverse()) {
+      if (
+        entry.type === "import-meta" ||
+        (entry.type === "dynamic" && entry.glob) ||
+        !entry.specifier ||
+        !/^(?:https?:|\/|\.\.?\/)/i.test(entry.specifier)
+      )
+        continue;
+      const target = await rewriteAsset(entry.specifier, base, from);
+      const start = entry.type === "dynamic" ? entry.start : entry.start - 1;
+      const end = entry.type === "dynamic" ? entry.end : entry.end + 1;
+      const literal = JSON.stringify(target).replace(/</g, "\\u003c");
+      source = source.slice(0, start) + literal + source.slice(end);
+    }
+    return source;
+  };
   const paths = new Map(pages.map((p) => [normalizeUrl(p.url), p.path!]));
+  const imageReplayPath = "assets/webexporter-images.js";
+  let needsImageReplay = false;
   for (const raw of rawPages) {
     const $ = load(raw.html);
     $(
@@ -489,6 +541,8 @@ export async function runCapture(
     });
     for (const el of $("style").toArray())
       $(el).text(await rewriteCss($(el).text(), raw.base, raw.page.path!));
+    for (const el of $('script[type="module"]:not([src])').toArray())
+      $(el).text(await rewriteScript($(el).text(), raw.base, raw.page.path!));
     for (const el of $("[style]").toArray()) {
       const rewritten = await rewriteCss(
         `x{${$(el).attr("style")}}`,
@@ -513,26 +567,48 @@ export async function runCapture(
         /* no action */
       }
     });
-    if ($("script").length)
+    if ($("script").length) {
       issue(
         "dependency",
         raw.page.url,
-        "Scripts are preserved where available. Dynamic imports, client-side routing and runtime-generated URLs may need manual adaptation.",
+        "Scripts and URL-based module imports are preserved where available. Computed imports, client-side routing and runtime API calls may need manual adaptation.",
       );
+      needsImageReplay = true;
+      $("head").prepend(
+        $("<script>").attr({
+          src: relativeUrl(raw.page.path!, imageReplayPath),
+          "data-source-base": raw.base,
+        }),
+      );
+    }
     const destination = path.join(site, raw.page.path!);
     await mkdir(path.dirname(destination), { recursive: true });
     await writeFile(destination, $.html());
   }
-  // A growing map is intentional: CSS can discover further imports, fonts and images.
+  // A growing map is intentional: CSS and JavaScript can discover more assets.
   for (const asset of assets.values()) {
     let body = asset.body;
     if (asset.mime === "text/css" || asset.path.endsWith(".css"))
       body = Buffer.from(
-        await rewriteCss(body.toString(), asset.url, asset.path),
+        await rewriteCss(body.toString(), asset.base, asset.path),
+      );
+    if (/\.(?:m?js)$/i.test(asset.path))
+      body = Buffer.from(
+        await rewriteScript(body.toString(), asset.base, asset.path),
       );
     const destination = path.join(site, asset.path);
     await mkdir(path.dirname(destination), { recursive: true });
     await writeFile(destination, body);
+  }
+  if (needsImageReplay) {
+    const images: Record<string, string> = {};
+    for (const [url, asset] of assets) {
+      if (asset.mime.startsWith("image/"))
+        images[url] = path.posix.basename(asset.path);
+    }
+    const destination = path.join(site, imageReplayPath);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, imageReplayScript(images));
   }
   const result: Result = {
     pages,

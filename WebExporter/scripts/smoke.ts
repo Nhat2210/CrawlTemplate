@@ -28,7 +28,7 @@ const fixture = http.createServer((req, res) => {
   } else if (req.url === "/font.woff2") {
     res.setHeader("Content-Type", "font/woff2");
     res.end(font);
-  } else if (req.url === "/tile.svg") {
+  } else if (req.url?.split("?")[0] === "/tile.svg") {
     res.setHeader("Content-Type", "image/svg+xml");
     res.end(
       '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><circle cx="60" cy="60" r="4" fill="#c6d9d6"/></svg>',
@@ -39,8 +39,38 @@ const fixture = http.createServer((req, res) => {
   } else if (req.url === "/app.js") {
     res.setHeader("Content-Type", "text/javascript");
     res.end(
-      `document.querySelector('#dynamic').innerHTML='<a href="/rendered">Rendered link</a>';`,
+      `document.querySelector('#dynamic').innerHTML='<a href="/rendered">Rendered link</a>';
+       document.body.dataset.captureMotion = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'reduced' : 'enabled';
+       if (!document.querySelector('#motion-rules')) {
+         const style = document.createElement('style');
+         style.id = 'motion-rules';
+         document.head.append(style);
+         style.sheet.insertRule('@keyframes pulse { from { opacity: 1 } to { opacity: .4 } }');
+         style.sheet.insertRule('#motion-test { animation: pulse 1s linear infinite alternate }');
+       }`,
     );
+  } else if (req.url === "/motion/main.js") {
+    res.setHeader("Content-Type", "text/javascript");
+    res.end(`import { duration } from '../common/timing.js';
+      const origin = 'http://127.0.0.1:4455';
+      const img = document.querySelector('#hydrated-image');
+      img.src = origin + '/tile.svg';
+      document.querySelector('#hydrated-source').setAttribute('srcSet',
+        origin + '/tile.svg?width=120&height=120 1x,' + origin + '/tile.svg?width=240&height=240 2x');
+      img.dataset.hydrated = 'true';
+      const button = document.querySelector('#motion-test');
+      button.addEventListener('click', async () => {
+        const { play } = await import('/motion/effect');
+        play(button, duration);
+      });`);
+  } else if (req.url === "/common/timing.js") {
+    res.setHeader("Content-Type", "text/javascript");
+    res.end("export const duration = 2000;");
+  } else if (req.url === "/motion/effect") {
+    res.setHeader("Content-Type", "text/javascript");
+    res.end(`export function play(button, duration) {
+      button.animate([{ transform: 'translateX(0px)' }, { transform: 'translateX(24px)' }], duration);
+    }`);
   } else if (req.url === "/slow") {
     setTimeout(() => {
       if (!res.destroyed) res.end("<html>Slow page</html>");
@@ -48,7 +78,7 @@ const fixture = http.createServer((req, res) => {
   } else {
     res.setHeader("Content-Type", "text/html");
     res.end(
-      `<!doctype html><html><head><title>${req.url === "/" ? "Studio fixture" : req.url === "/about" ? "About the studio" : "Rendered page"}</title><link rel="stylesheet" href="/style.css"></head><body><h1>Studio fixture</h1><p>A rendered website for a real export test.</p><a href="/">Home</a> · <a href="/about">About</a><div id="dynamic"></div><img src="/tile.svg" alt="Pattern"><img src="/missing.png" alt="Deliberately missing image"><script src="/app.js"></script></body></html>`,
+      `<!doctype html><html><head><title>${req.url === "/" ? "Studio fixture" : req.url === "/about" ? "About the studio" : "Rendered page"}</title><link rel="stylesheet" href="/style.css"></head><body><h1>Studio fixture</h1><p>A rendered website for a real export test.</p><a href="/">Home</a> · <a href="/about">About</a><div id="dynamic"></div><picture><source id="hydrated-source" srcset="/tile.svg?height=120&amp;width=120 1x, /tile.svg?height=240&amp;width=240 2x"><img id="hydrated-image" src="/tile.svg" alt="Pattern"></picture><img src="/missing.png" alt="Deliberately missing image"><button id="motion-test">Play motion</button><script src="/app.js"></script><script type="module" src="/motion/main.js"></script></body></html>`,
     );
   }
 });
@@ -162,6 +192,8 @@ try {
   assert.ok(html.includes("./assets/"));
   assert.ok(html.includes("./pages/about-"));
   assert.ok(!html.includes('src="/tile.svg"'));
+  assert.match(html, /data-capture-motion="enabled"/);
+  assert.match(html, /@keyframes pulse/);
   const { stdout: zipTest } = await exec("unzip", [
     "-t",
     path.join(storage, "jobs", job.id, "website.zip"),
@@ -200,6 +232,39 @@ try {
   assert.ok(capturedFrame, "Exported iframe is mounted");
   await capturedFrame.waitForFunction(() =>
     document.fonts.check("16px Fixture"),
+  );
+  await capturedFrame.waitForFunction(() => {
+    const img = document.querySelector<HTMLImageElement>("#hydrated-image")!;
+    const source =
+      document.querySelector<HTMLSourceElement>("#hydrated-source")!;
+    return (
+      img.dataset.hydrated === "true" &&
+      img.naturalWidth > 0 &&
+      new URL(img.src).origin === location.origin &&
+      new URL(img.currentSrc).origin === location.origin &&
+      !source.srcset.includes("127.0.0.1:4455")
+    );
+  });
+  await capturedFrame.waitForFunction(() =>
+    document
+      .querySelector("#motion-test")
+      ?.getAnimations()
+      .some(
+        (animation) =>
+          animation instanceof CSSAnimation &&
+          animation.playState === "running",
+      ),
+  );
+  await capturedFrame.getByRole("button", { name: "Play motion" }).click();
+  await capturedFrame.waitForFunction(() =>
+    document
+      .querySelector("#motion-test")
+      ?.getAnimations()
+      .some(
+        (animation) =>
+          !(animation instanceof CSSAnimation) &&
+          animation.playState === "running",
+      ),
   );
   await page.getByRole("button", { name: "Compare", exact: true }).click();
   await page.screenshot({
@@ -263,7 +328,7 @@ try {
     "cancelled",
   );
   console.log(
-    `PASS: UI create → scan → export → preview → report → ZIP download; ${job.result!.pages.length} rendered pages, ${job.result!.assetCount} assets; CSS rewrites, responsive layouts, cancellation and local origin guard.`,
+    `PASS: UI create → scan → export → preview → report → ZIP download; ${job.result!.pages.length} rendered pages, ${job.result!.assetCount} assets; CSS and JavaScript motion, responsive layouts, cancellation and local origin guard.`,
   );
 } catch (error) {
   console.error(output);

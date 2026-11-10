@@ -21,7 +21,11 @@ The workspace keeps each website's scans, exports and reports together. Projects
 
 WebExporter creates a **rendered static capture**, not the original site's source project. An export is useful as a portable snapshot, a reference, or a starting point for rebuilding a site.
 
-Backend services, databases, account systems, authentication and payment processing are not included. Preserved scripts can still depend on client-side routing, dynamic imports, runtime-generated URLs or remote APIs. Rendering a SPA successfully does not guarantee its exported interactions will work independently.
+Captures run with standard motion preferences. The exporter preserves CSS keyframes, rules inserted into empty style elements at runtime, and URL-based JavaScript module imports, including literal dynamic imports used to load effects on demand.
+
+If a site's scripts restore the original image URLs after load, the export maps known `src` and `srcset` URLs back to the bundled images. This also works when a static host serves the export from a subdirectory.
+
+Backend services, databases, account systems, authentication and payment processing are not included. Preserved scripts can still depend on client-side routing, computed imports, runtime-generated URLs or remote APIs. Rendering a SPA successfully does not guarantee its exported interactions will work independently.
 
 The original view is a **desktop screenshot taken during export**. It is not a live connection to the source website. Device controls select a fixed viewport width for the exported preview (1366, 768 or 390 pixels), scaled to fit the workspace; they do not recapture the original at another viewport. No automated visual similarity score is claimed.
 
